@@ -131,8 +131,42 @@ def get_permission_sets(sso_admin_client, instance_arn):
                     )
                     permission_sets[arn] = {
                         'Name': details['PermissionSet']['Name'],
-                        'Description': details['PermissionSet'].get('Description', 'N/A')
+                        'Description': details['PermissionSet'].get('Description', 'N/A'),
+                        'ManagedPolicies': [],
+                        'InlinePolicy': 'None',
+                        'CustomerManagedPolicies': []
                     }
+                    
+                    # 1. Fetch AWS Managed Policies
+                    try:
+                        mp_paginator = sso_admin_client.get_paginator('list_managed_policies_in_permission_set')
+                        for mp_page in mp_paginator.paginate(InstanceArn=instance_arn, PermissionSetArn=arn):
+                            for mp in mp_page['AttachedManagedPolicies']:
+                                permission_sets[arn]['ManagedPolicies'].append(mp['Name'])
+                    except ClientError as e:
+                        logger.warning(f"  - Could not list managed policies for {permission_sets[arn]['Name']}: {e}")
+
+                    # 2. Fetch Inline Policy
+                    try:
+                        inline_resp = sso_admin_client.get_inline_policy_for_permission_set(
+                            InstanceArn=instance_arn, 
+                            PermissionSetArn=arn
+                        )
+                        if inline_resp.get('InlinePolicy'):
+                            permission_sets[arn]['InlinePolicy'] = "Present (See Console)" # Keeping it brief for Excel, or could dump JSON
+                    except ClientError as e:
+                        # Some PS might not have inline policies or just error out
+                        pass 
+
+                    # 3. Fetch Customer Managed Policies
+                    try:
+                        cmp_paginator = sso_admin_client.get_paginator('list_customer_managed_policy_references_in_permission_set')
+                        for cmp_page in cmp_paginator.paginate(InstanceArn=instance_arn, PermissionSetArn=arn):
+                            for cmp in cmp_page['CustomerManagedPolicyReferences']:
+                                permission_sets[arn]['CustomerManagedPolicies'].append(cmp['Name'])
+                    except ClientError as e:
+                        pass
+                        
                 except ClientError as e:
                     logger.warning(f"Could not describe permission set {arn}: {e}")
         logger.info(f"Fetched {len(permission_sets)} permission sets.")
@@ -328,8 +362,17 @@ def main():
             group_rows = [{'Group ID': k, 'Group Name': v['Name'], 'Description': v['Description']} for k, v in groups.items()]
             df_groups = pd.DataFrame(group_rows)
             
-            # permission_sets dict is {Arn: {Name, Description}}
-            ps_rows = [{'Permission Set ARN': k, 'Permission Set Name': v['Name'], 'Description': v['Description']} for k, v in permission_sets.items()]
+            # permission_sets dict is {Arn: {Name, Description, ManagedPolicies[], InlinePolicy, CustomerManagedPolicies[]}}
+            ps_rows = []
+            for k, v in permission_sets.items():
+                ps_rows.append({
+                    'Permission Set ARN': k, 
+                    'Permission Set Name': v['Name'], 
+                    'Description': v['Description'],
+                    'AWS Managed Policies': ", ".join(v['ManagedPolicies']),
+                    'Inline Policy': v['InlinePolicy'],
+                    'Customer Managed Policies': ", ".join(v['CustomerManagedPolicies'])
+                })
             df_permission_sets = pd.DataFrame(ps_rows)
 
             output_file = 'AWS_Identity_Center_Review.xlsx'
