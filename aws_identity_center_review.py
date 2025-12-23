@@ -57,7 +57,10 @@ def list_all_groups(identitystore_client, identity_store_id):
     try:
         for page in paginator.paginate(IdentityStoreId=identity_store_id):
             for group in page['Groups']:
-                groups[group['GroupId']] = group['DisplayName']
+                groups[group['GroupId']] = {
+                    'Name': group['DisplayName'],
+                    'Description': group.get('Description', 'N/A')
+                }
         logger.info(f"Fetched {len(groups)} groups.")
         return groups
     except ClientError as e:
@@ -81,7 +84,8 @@ def list_group_memberships(identitystore_client, identity_store_id, groups):
                     
                     if member_id not in user_group_map:
                         user_group_map[member_id] = []
-                    user_group_map[member_id].append(group_name)
+                    # group_info is now a dict, so access Name
+                    user_group_map[member_id].append(group_name['Name'])
             
             group_members[group_id] = members
             count += 1
@@ -125,7 +129,10 @@ def get_permission_sets(sso_admin_client, instance_arn):
                         InstanceArn=instance_arn,
                         PermissionSetArn=arn
                     )
-                    permission_sets[arn] = details['PermissionSet']['Name']
+                    permission_sets[arn] = {
+                        'Name': details['PermissionSet']['Name'],
+                        'Description': details['PermissionSet'].get('Description', 'N/A')
+                    }
                 except ClientError as e:
                     logger.warning(f"Could not describe permission set {arn}: {e}")
         logger.info(f"Fetched {len(permission_sets)} permission sets.")
@@ -157,7 +164,8 @@ def map_assignments(sso_admin_client, instance_arn, accounts, permission_sets, u
 
             # 2. For each provisioned permission set, list assignments
             for ps_arn in account_permission_sets:
-                ps_name = permission_sets.get(ps_arn, "Unknown Permission Set")
+                ps_data = permission_sets.get(ps_arn, {'Name': "Unknown Permission Set"})
+                ps_name = ps_data['Name']
                 
                 assign_paginator = sso_admin_client.get_paginator('list_account_assignments')
                 for page in assign_paginator.paginate(
@@ -184,7 +192,8 @@ def map_assignments(sso_admin_client, instance_arn, accounts, permission_sets, u
                             
                         # Case 2: Group Assignment
                         elif principal_type == 'GROUP':
-                            group_name = groups.get(principal_id, 'Unknown Group')
+                            group_info = groups.get(principal_id, {'Name': 'Unknown Group'})
+                            group_name = group_info['Name']
                             # Get all users in this group
                             # We need to inverse the group->user map we made or iterate users
                             # In list_group_memberships we returned group_members dict: GroupID -> [UserIDs]
@@ -248,7 +257,8 @@ def main():
                 continue
                 
             for ps_arn in account_permission_sets:
-                ps_name = permission_sets.get(ps_arn, "Unknown Permission Set")
+                ps_data = permission_sets.get(ps_arn, {'Name': "Unknown Permission Set"})
+                ps_name = ps_data['Name']
                 
                 # List Assignments
                 try:
@@ -273,7 +283,8 @@ def main():
                             
                             elif principal_type == 'GROUP':
                                 # Group Assignment - Expand to all members
-                                g_name = groups.get(principal_id, 'Unknown Group')
+                                g_info = groups.get(principal_id, {'Name': 'Unknown Group'})
+                                g_name = g_info['Name']
                                 member_ids = group_members.get(principal_id, [])
                                 
                                 if not member_ids:
@@ -313,8 +324,13 @@ def main():
             df_assignments = df_assignments.sort_values(by=['User Name', 'Account Name'])
             
             # Create DataFrames for Metadata Sheets
-            df_groups = pd.DataFrame(list(groups.items()), columns=['Group ID', 'Group Name'])
-            df_permission_sets = pd.DataFrame(list(permission_sets.items()), columns=['Permission Set ARN', 'Permission Set Name'])
+            # groups dict is {Id: {Name, Description}}
+            group_rows = [{'Group ID': k, 'Group Name': v['Name'], 'Description': v['Description']} for k, v in groups.items()]
+            df_groups = pd.DataFrame(group_rows)
+            
+            # permission_sets dict is {Arn: {Name, Description}}
+            ps_rows = [{'Permission Set ARN': k, 'Permission Set Name': v['Name'], 'Description': v['Description']} for k, v in permission_sets.items()]
+            df_permission_sets = pd.DataFrame(ps_rows)
 
             output_file = 'AWS_Identity_Center_Review.xlsx'
             logger.info(f"Saving to {output_file}...")
