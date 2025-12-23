@@ -1,0 +1,348 @@
+import boto3
+import pandas as pd
+import logging
+from botocore.exceptions import ClientError
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def get_clients(region_name='ap-south-1'):
+    """Initialize and return AWS clients."""
+    try:
+        identitystore = boto3.client('identitystore', region_name=region_name)
+        sso_admin = boto3.client('sso-admin', region_name=region_name)
+        orgs = boto3.client('organizations', region_name=region_name)
+        return identitystore, sso_admin, orgs
+    except Exception as e:
+        logger.error(f"Failed to create boto3 clients: {e}")
+        raise
+
+def get_sso_instance(sso_admin_client):
+    """Retrieve the SSO Instance ARN and Identity Store ID."""
+    try:
+        response = sso_admin_client.list_instances()
+        if not response['Instances']:
+            raise Exception("No SSO Instances found.")
+        # Assuming the first instance is the one we want
+        instance = response['Instances'][0]
+        return instance['InstanceArn'], instance['IdentityStoreId']
+    except ClientError as e:
+        logger.error(f"Error fetching SSO instance: {e}")
+        raise
+
+def list_all_users(identitystore_client, identity_store_id):
+    """Fetch all users from Identity Store."""
+    users = {}
+    paginator = identitystore_client.get_paginator('list_users')
+    try:
+        for page in paginator.paginate(IdentityStoreId=identity_store_id):
+            for user in page['Users']:
+                users[user['UserId']] = {
+                    'UserName': user.get('UserName'),
+                    'DisplayName': user.get('DisplayName'),
+                    'Email': user['Emails'][0]['Value'] if user.get('Emails') else 'N/A',
+                    'Active': True # Identity Store doesn't always expose efficient active/inactive in list, assuming active if listed or need specific attr
+                }
+        logger.info(f"Fetched {len(users)} users.")
+        return users
+    except ClientError as e:
+        logger.error(f"Error listing users: {e}")
+        raise
+
+def list_all_groups(identitystore_client, identity_store_id):
+    """Fetch all groups from Identity Store."""
+    groups = {}
+    paginator = identitystore_client.get_paginator('list_groups')
+    try:
+        for page in paginator.paginate(IdentityStoreId=identity_store_id):
+            for group in page['Groups']:
+                groups[group['GroupId']] = group['DisplayName']
+        logger.info(f"Fetched {len(groups)} groups.")
+        return groups
+    except ClientError as e:
+        logger.error(f"Error listing groups: {e}")
+        raise
+
+def list_group_memberships(identitystore_client, identity_store_id, groups):
+    """Map Group IDs to a list of User IDs."""
+    group_members = {} # GroupID -> [UserID, UserID, ...]
+    user_group_map = {} # UserID -> [GroupName1, GroupName2] helper for mapping
+    
+    try:
+        count = 0 
+        for group_id, group_name in groups.items():
+            paginator = identitystore_client.get_paginator('list_group_memberships')
+            members = []
+            for page in paginator.paginate(IdentityStoreId=identity_store_id, GroupId=group_id):
+                for member in page['GroupMemberships']:
+                    member_id = member['MemberId']['UserId']
+                    members.append(member_id)
+                    
+                    if member_id not in user_group_map:
+                        user_group_map[member_id] = []
+                    user_group_map[member_id].append(group_name)
+            
+            group_members[group_id] = members
+            count += 1
+            if count % 10 == 0:
+                logger.info(f"Processed memberships for {count} groups...")
+                
+        logger.info("Finished processing group memberships.")
+        return group_members, user_group_map
+    except ClientError as e:
+        logger.error(f"Error listing group memberships: {e}")
+        raise
+
+def list_all_accounts(org_client):
+    """Fetch all AWS accounts in the organization."""
+    accounts = {}
+    paginator = org_client.get_paginator('list_accounts')
+    try:
+        for page in paginator.paginate():
+            for account in page['Accounts']:
+                # Filter for active accounts if needed, but for review listing all might be safer
+                if account['Status'] == 'ACTIVE':
+                    accounts[account['Id']] = account['Name']
+        logger.info(f"Fetched {len(accounts)} active accounts.")
+        return accounts
+    except ClientError as e:
+        logger.error(f"Error listing accounts: {e}")
+        raise
+
+def get_permission_sets(sso_admin_client, instance_arn):
+    """Fetch all permission sets."""
+    permission_sets = {} # Arn -> Name
+    paginator = sso_admin_client.get_paginator('list_permission_sets')
+    try:
+        for page in paginator.paginate(InstanceArn=instance_arn):
+            for arn in page['PermissionSets']:
+                # Get details to get the name
+                # Optimizing: List gives ARNs, describe gives name. 
+                # This might be slow if many sets.
+                try: 
+                    details = sso_admin_client.describe_permission_set(
+                        InstanceArn=instance_arn,
+                        PermissionSetArn=arn
+                    )
+                    permission_sets[arn] = details['PermissionSet']['Name']
+                except ClientError as e:
+                    logger.warning(f"Could not describe permission set {arn}: {e}")
+        logger.info(f"Fetched {len(permission_sets)} permission sets.")
+        return permission_sets
+    except ClientError as e:
+        logger.error(f"Error listing permission sets: {e}")
+        raise
+
+def map_assignments(sso_admin_client, instance_arn, accounts, permission_sets, users, groups, user_group_map):
+    """
+    Iterate through accounts to find provisioned permission sets, then list assignments.
+    Flatten the data into a list of dictionaries for export.
+    """
+    data_rows = []
+    
+    for account_id, account_name in accounts.items():
+        logger.info(f"Scanning account: {account_name} ({account_id})")
+        
+        # 1. List Permission Sets provisioned to this account
+        # Note: This avoids checking every permission set against every account
+        prov_paginator = sso_admin_client.get_paginator('list_permission_sets_provisioned_to_account')
+        try:
+            account_permission_sets = []
+            for page in prov_paginator.paginate(InstanceArn=instance_arn, AccountId=account_id):
+                account_permission_sets.extend(page['PermissionSets'])
+            
+            if not account_permission_sets:
+                continue
+
+            # 2. For each provisioned permission set, list assignments
+            for ps_arn in account_permission_sets:
+                ps_name = permission_sets.get(ps_arn, "Unknown Permission Set")
+                
+                assign_paginator = sso_admin_client.get_paginator('list_account_assignments')
+                for page in assign_paginator.paginate(
+                    InstanceArn=instance_arn,
+                    AccountId=account_id,
+                    PermissionSetArn=ps_arn
+                ):
+                    for assignment in page['AccountAssignments']:
+                        principal_type = assignment['PrincipalType']
+                        principal_id = assignment['PrincipalId']
+                        
+                        # Case 1: Direct User Assignment
+                        if principal_type == 'USER':
+                            user_details = users.get(principal_id, {'UserName': 'Unknown', 'Email': 'Unknown'})
+                            data_rows.append({
+                                'Account Name': account_name,
+                                'Account ID': account_id,
+                                'Permission Set': ps_name,
+                                'Principal Type': 'USER',
+                                'Principal Name': user_details['UserName'],
+                                'User Email': user_details['Email'],
+                                'Access Method': 'DIRECT'
+                            })
+                            
+                        # Case 2: Group Assignment
+                        elif principal_type == 'GROUP':
+                            group_name = groups.get(principal_id, 'Unknown Group')
+                            # Get all users in this group
+                            # We need to inverse the group->user map we made or iterate users
+                            # In list_group_memberships we returned group_members dict: GroupID -> [UserIDs]
+                            
+                            # Re-fetch members from the dict passed in (users/groups need to be passed correctly)
+                            # Let's fix the logic to use what we have.
+                            # We need to pass `group_members` (Group ID -> List of User IDs) into this function
+                            pass # Handled below by iterating the group members
+                            
+        except ClientError as e:
+            logger.error(f"Error scanning account {account_id}: {e}")
+            
+    return data_rows
+
+def main():
+    try:
+        # 1. Setup Clients
+        logger.info("Initializing clients...")
+        # You might want to allow region selection via args
+        identitystore, sso_admin, orgs = get_clients() 
+        
+        # 2. Get Instance Info
+        logger.info("Fetching SSO Instance info...")
+        instance_arn, identity_store_id = get_sso_instance(sso_admin)
+        logger.info(f"Instance ARN: {instance_arn}")
+        
+        # 3. Fetch Core Data
+        logger.info("Fetching Users...")
+        users = list_all_users(identitystore, identity_store_id)
+        
+        logger.info("Fetching Groups...")
+        groups = list_all_groups(identitystore, identity_store_id)
+        
+        logger.info("Fetching Group Memberships...")
+        group_members, user_group_map = list_group_memberships(identitystore, identity_store_id, groups)
+        
+        logger.info("Fetching Accounts...")
+        accounts = list_all_accounts(orgs)
+        
+        logger.info("Fetching Permission Sets...")
+        permission_sets = get_permission_sets(sso_admin, instance_arn)
+        
+        # 4. Map Assignments and Build Report
+        logger.info("Mapping assignments to users...")
+        final_report = []
+        
+        # The logic in 'map_assignments' was slightly incomplete regarding Group expansion.
+        # Let's implement the core iteration logic here for clarity.
+        
+        for account_id, account_name in accounts.items():
+            logger.info(f"Scanning account: {account_name} ({account_id})")
+            
+            # Get Provisioned Permission Sets
+            try:
+                prov_paginator = sso_admin.get_paginator('list_permission_sets_provisioned_to_account')
+                account_permission_sets = []
+                for page in prov_paginator.paginate(InstanceArn=instance_arn, AccountId=account_id):
+                    account_permission_sets.extend(page['PermissionSets'])
+            except ClientError as e:
+                logger.error(f"Failed to list provisioned permission sets for {account_name}: {e}")
+                continue
+                
+            for ps_arn in account_permission_sets:
+                ps_name = permission_sets.get(ps_arn, "Unknown Permission Set")
+                
+                # List Assignments
+                try:
+                    assign_paginator = sso_admin.get_paginator('list_account_assignments')
+                    for page in assign_paginator.paginate(InstanceArn=instance_arn, AccountId=account_id, PermissionSetArn=ps_arn):
+                        for assignment in page['AccountAssignments']:
+                            principal_type = assignment['PrincipalType']
+                            principal_id = assignment['PrincipalId']
+                            
+                            if principal_type == 'USER':
+                                # Direct Assignment
+                                u = users.get(principal_id, {})
+                                final_report.append({
+                                    'Account Name': account_name,
+                                    'Account ID': account_id,
+                                    'Permission Set': ps_name,
+                                    'Assignment Type': 'Direct User',
+                                    'Group Name': 'N/A',
+                                    'User Name': u.get('UserName', 'Unknown'),
+                                    'User Email': u.get('Email', 'Unknown')
+                                })
+                            
+                            elif principal_type == 'GROUP':
+                                # Group Assignment - Expand to all members
+                                g_name = groups.get(principal_id, 'Unknown Group')
+                                member_ids = group_members.get(principal_id, [])
+                                
+                                if not member_ids:
+                                    # Group has assignment but no members
+                                    final_report.append({
+                                        'Account Name': account_name,
+                                        'Account ID': account_id,
+                                        'Permission Set': ps_name,
+                                        'Assignment Type': 'Group (Empty)',
+                                        'Group Name': g_name,
+                                        'User Name': 'N/A',
+                                        'User Email': 'N/A'
+                                    })
+                                else:
+                                    for m_id in member_ids:
+                                        u = users.get(m_id, {})
+                                        final_report.append({
+                                            'Account Name': account_name,
+                                            'Account ID': account_id,
+                                            'Permission Set': ps_name,
+                                            'Assignment Type': 'Group',
+                                            'Group Name': g_name,
+                                            'User Name': u.get('UserName', 'Unknown'),
+                                            'User Email': u.get('Email', 'Unknown')
+                                        })
+                except ClientError as e:
+                    logger.error(f"Failed to list assignments for {ps_name} in {account_name}: {e}")
+
+        # 5. Export to Excel
+        if not final_report:
+            logger.warning("No assignments found!")
+        else:
+            logger.info(f"Generating Excel report with {len(final_report)} rows...")
+            df_assignments = pd.DataFrame(final_report)
+            
+            # Sort by User Name for user-centric view
+            df_assignments = df_assignments.sort_values(by=['User Name', 'Account Name'])
+            
+            # Create DataFrames for Metadata Sheets
+            df_groups = pd.DataFrame(list(groups.items()), columns=['Group ID', 'Group Name'])
+            df_permission_sets = pd.DataFrame(list(permission_sets.items()), columns=['Permission Set ARN', 'Permission Set Name'])
+
+            output_file = 'AWS_Identity_Center_Review.xlsx'
+            logger.info(f"Saving to {output_file}...")
+            
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                df_assignments.to_excel(writer, sheet_name='Assignments', index=False)
+                df_groups.to_excel(writer, sheet_name='Groups', index=False)
+                df_permission_sets.to_excel(writer, sheet_name='Permission Sets', index=False)
+                
+                # Auto-adjust column widths
+                for sheet in writer.sheets.values():
+                    for col in sheet.columns:
+                        max_length = 0
+                        column = col[0].column_letter # Get the column name
+                        for cell in col:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(cell.value)
+                            except:
+                                pass
+                        adjusted_width = (max_length + 2)
+                        sheet.column_dimensions[column].width = min(adjusted_width, 100) # Cap width
+
+            logger.info(f"Successfully saved report to {output_file}")
+            
+    except Exception as main_e:
+        logger.error(f"Script failed: {main_e}")
+        raise
+
+if __name__ == '__main__':
+    main()
