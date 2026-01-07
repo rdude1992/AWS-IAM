@@ -1,6 +1,14 @@
 import boto3
 import pandas as pd
 import logging
+import smtplib
+import os
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from datetime import datetime
+from dotenv import load_dotenv
 from botocore.exceptions import ClientError
 
 # Configure logging
@@ -242,6 +250,87 @@ def map_assignments(sso_admin_client, instance_arn, accounts, permission_sets, u
             
     return data_rows
 
+def send_email_with_attachment(output_file):
+    """
+    Send email with the Excel report as attachment using SMTP.
+    """
+    try:
+        # Load environment variables
+        load_dotenv()
+
+        # Get email configuration from environment variables
+        smtp_server = os.getenv('SMTP_SERVER')
+        smtp_port = int(os.getenv('SMTP_PORT', 587))
+        email_username = os.getenv('EMAIL_USERNAME')
+        email_password = os.getenv('EMAIL_PASSWORD')
+        email_recipients = os.getenv('EMAIL_RECIPIENTS')
+        email_sender_name = os.getenv('EMAIL_SENDER_NAME', 'AWS Identity Center Review System')
+        email_subject = os.getenv('EMAIL_SUBJECT', 'AWS Identity Center Access Review Report')
+
+        # Validate required environment variables
+        if not all([smtp_server, email_username, email_password, email_recipients]):
+            logger.warning("Email configuration incomplete. Skipping email notification.")
+            logger.warning("Please set SMTP_SERVER, EMAIL_USERNAME, EMAIL_PASSWORD, and EMAIL_RECIPIENTS in .env file")
+            return False
+
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = f"{email_sender_name} <{email_username}>"
+        msg['To'] = email_recipients
+        msg['Subject'] = f"{email_subject} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+        # Email body
+        body = f"""
+Dear Team,
+
+Please find attached the latest AWS Identity Center Access Review Report.
+
+Report Details:
+- Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- File: {output_file}
+
+This report contains:
+1. User assignments to AWS accounts and permission sets
+2. Group information and memberships
+3. Permission set details with associated policies
+
+Please review the access assignments and ensure they align with your security policies.
+
+Best regards,
+AWS Identity Center Review System
+        """
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Attach the Excel file
+        if os.path.exists(output_file):
+            with open(output_file, 'rb') as attachment:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(attachment.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f"attachment; filename= {output_file}")
+                msg.attach(part)
+        else:
+            logger.error(f"Report file {output_file} not found. Cannot send email.")
+            return False
+
+        # Send email
+        logger.info("Sending email notification...")
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(email_username, email_password)
+
+        # Send to multiple recipients
+        recipients_list = [email.strip() for email in email_recipients.split(',')]
+        server.sendmail(email_username, recipients_list, msg.as_string())
+        server.quit()
+
+        logger.info(f"Email sent successfully to: {', '.join(recipients_list)}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        return False
+
 def main():
     try:
         # 1. Setup Clients
@@ -398,7 +487,15 @@ def main():
                         sheet.column_dimensions[column].width = min(adjusted_width, 100) # Cap width
 
             logger.info(f"Successfully saved report to {output_file}")
-            
+
+            # 6. Send email notification with report
+            logger.info("Attempting to send email notification...")
+            email_sent = send_email_with_attachment(output_file)
+            if email_sent:
+                logger.info("Report generation and email notification completed successfully!")
+            else:
+                logger.warning("Report generated successfully, but email notification failed.")
+
     except Exception as main_e:
         logger.error(f"Script failed: {main_e}")
         raise
