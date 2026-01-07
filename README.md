@@ -50,8 +50,8 @@ The script can automatically send the generated report as an email attachment. T
    # Required settings
    SMTP_SERVER=smtp.gmail.com
    SMTP_PORT=587
-   EMAIL_USERNAME=your-email@gmail.com
-   EMAIL_PASSWORD=your-app-password
+   EMAIL_USERNAME=your-email@gmail.com (optional- keep blank if no auth required)
+   EMAIL_PASSWORD=your-app-password (optional- keep blank if no auth required)
    EMAIL_RECIPIENTS=admin@company.com,security@company.com
 
    # Optional settings
