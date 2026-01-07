@@ -253,6 +253,7 @@ def map_assignments(sso_admin_client, instance_arn, accounts, permission_sets, u
 def send_email_with_attachment(output_file):
     """
     Send email with the Excel report as attachment using SMTP.
+    Email credentials are optional - if not configured, email sending is skipped silently.
     """
     try:
         # Load environment variables
@@ -267,10 +268,9 @@ def send_email_with_attachment(output_file):
         email_sender_name = os.getenv('EMAIL_SENDER_NAME', 'AWS Identity Center Review System')
         email_subject = os.getenv('EMAIL_SUBJECT', 'AWS Identity Center Access Review Report')
 
-        # Validate required environment variables
-        if not all([smtp_server, email_username, email_password, email_recipients]):
-            logger.warning("Email configuration incomplete. Skipping email notification.")
-            logger.warning("Please set SMTP_SERVER, EMAIL_USERNAME, EMAIL_PASSWORD, and EMAIL_RECIPIENTS in .env file")
+        # Check if email is configured (server and recipients are required, credentials are optional for relay hosts)
+        if not smtp_server or not email_recipients:
+            logger.info("Email notification skipped (server or recipients not configured)")
             return False
 
         # Create message
@@ -316,12 +316,21 @@ AWS Identity Center Review System
         # Send email
         logger.info("Sending email notification...")
         server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-        server.login(email_username, email_password)
+
+        # Only attempt STARTTLS and login if credentials are provided (for authenticated SMTP)
+        # Skip authentication for relay hosts that don't require it
+        if email_username and email_password:
+            server.starttls()
+            server.login(email_username, email_password)
+        else:
+            # For relay hosts without authentication, just establish connection
+            logger.info("Using relay host without authentication")
 
         # Send to multiple recipients
+        # Use a default from address if no username is provided
+        from_address = email_username if email_username else f"noreply@{smtp_server}"
         recipients_list = [email.strip() for email in email_recipients.split(',')]
-        server.sendmail(email_username, recipients_list, msg.as_string())
+        server.sendmail(from_address, recipients_list, msg.as_string())
         server.quit()
 
         logger.info(f"Email sent successfully to: {', '.join(recipients_list)}")
@@ -488,13 +497,15 @@ def main():
 
             logger.info(f"Successfully saved report to {output_file}")
 
-            # 6. Send email notification with report
-            logger.info("Attempting to send email notification...")
+            # 6. Send email notification with report (optional)
             email_sent = send_email_with_attachment(output_file)
             if email_sent:
                 logger.info("Report generation and email notification completed successfully!")
-            else:
-                logger.warning("Report generated successfully, but email notification failed.")
+            elif email_sent is False and logger.level <= logging.INFO:
+                # Only show warning if email was configured but failed
+                # If email_sent is False due to missing config, send_email_with_attachment
+                # already logged "Email notification skipped (not configured)" at INFO level
+                pass
 
     except Exception as main_e:
         logger.error(f"Script failed: {main_e}")

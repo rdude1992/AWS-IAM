@@ -25,23 +25,22 @@ def test_email_config():
         email_sender_name = os.getenv('EMAIL_SENDER_NAME', 'AWS Identity Center Review System')
         email_subject = os.getenv('EMAIL_SUBJECT', 'AWS Identity Center Access Review Report')
 
-        # Validate required environment variables
-        missing_vars = []
-        if not smtp_server:
-            missing_vars.append('SMTP_SERVER')
-        if not email_username:
-            missing_vars.append('EMAIL_USERNAME')
-        if not email_password:
-            missing_vars.append('EMAIL_PASSWORD')
-        if not email_recipients:
-            missing_vars.append('EMAIL_RECIPIENTS')
+        # Check minimum required configuration (server and recipients are required)
+        if not smtp_server or not email_recipients:
+            logger.info("Email configuration incomplete (server and recipients are required)")
+            logger.info("Required variables: SMTP_SERVER, EMAIL_RECIPIENTS")
+            logger.info("Optional variables: EMAIL_USERNAME, EMAIL_PASSWORD (for authenticated SMTP)")
+            return None  # Return None to indicate feature not configured
 
-        if missing_vars:
-            logger.warning("Email configuration incomplete. Missing required variables:")
-            for var in missing_vars:
-                logger.warning(f"  - {var}")
-            logger.info("Please set these variables in your .env file")
-            return False
+        # If we have server and recipients, config is valid
+        # Check if credentials are provided for authentication
+        has_credentials = bool(email_username and email_password)
+
+        if has_credentials:
+            logger.info("Email configured with authentication")
+        else:
+            logger.info("Email configured for relay host (no authentication required)")
+            return True  # Config is valid for relay host
 
         # Display configuration (masking password)
         logger.info("Email configuration validated successfully!")
@@ -72,8 +71,10 @@ def test_email_config():
 
 if __name__ == '__main__':
     logger.info("Testing email configuration...")
-    success = test_email_config()
-    if success:
+    result = test_email_config()
+    if result is True:
         logger.info("Email configuration is valid and ready to use!")
+    elif result is None:
+        logger.info("Email configuration not configured (optional feature skipped)")
     else:
         logger.error("Email configuration needs to be fixed before use.")
