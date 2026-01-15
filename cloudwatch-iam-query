@@ -1,0 +1,13 @@
+fields @timestamp as eventTimeIST,
+       userIdentity.principalId,
+       eventName,
+       responseElements.ConsoleLogin as loginStatus
+| filter eventName = "ConsoleLogin"
+| parse userIdentity.principalId "*:*" as discard, username
+| stats
+    max(eventTimeIST) as lastConsoleLoginIST,
+    latest(loginStatus) as lastLoginStatus,
+    count(loginStatus = "Success") as successfulAttempts,
+    count(loginStatus = "Failure") as failedAttempts
+  by username
+| sort lastConsoleLoginIST desc
